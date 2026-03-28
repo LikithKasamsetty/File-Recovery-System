@@ -1,0 +1,376 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, scrolledtext
+from datetime import datetime
+import os
+from backend import FileSystem
+
+class FileSystemGUI:
+    def _init_(self, root):
+        self.root = root
+        self.root.title("File System Recovery and Optimization Tool")
+        self.root.geometry("1000x700")
+        
+        self.fs = FileSystem()
+        self.create_menu()
+        self.create_left_panel()
+        self.create_right_panel()
+        
+        self.status_var = tk.StringVar()
+        self.status_bar = tk.Label(root, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        self.update_status("Ready")
+        self.update_file_list()
+    
+    def create_menu(self):
+        menubar = tk.Menu(self.root)
+        
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="New Filesystem", command=self.new_filesystem)
+        file_menu.add_command(label="Load Filesystem", command=self.load_filesystem)
+        file_menu.add_command(label="Save Filesystem", command=self.save_filesystem)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.root.quit)
+        menubar.add_cascade(label="File", menu=file_menu)
+        
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="Check Filesystem (FSCK)", command=self.run_fsck)
+        tools_menu.add_command(label="Defragment", command=self.defragment)
+        tools_menu.add_command(label="Recover Deleted Files", command=self.show_recovery_dialog)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        
+        self.root.config(menu=menubar)
+    
+    def create_left_panel(self):
+        left_frame = tk.Frame(self.root, width=300, bd=2, relief=tk.SUNKEN)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+        
+        self.path_var = tk.StringVar()
+        path_label = tk.Label(left_frame, text="Current Path:")
+        path_label.pack(anchor=tk.W)
+        path_display = tk.Entry(left_frame, textvariable=self.path_var, state='readonly')
+        path_display.pack(fill=tk.X, pady=(0, 10))
+        
+        self.tree = ttk.Treeview(left_frame)
+        self.tree.pack(expand=True, fill=tk.BOTH)
+        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        
+        nav_frame = tk.Frame(left_frame)
+        nav_frame.pack(fill=tk.X, pady=5)
+        
+        up_btn = tk.Button(nav_frame, text="↑ Up", command=self.navigate_up)
+        up_btn.pack(side=tk.LEFT, expand=True)
+        
+        home_btn = tk.Button(nav_frame, text="Home (/)", command=self.navigate_home)
+        home_btn.pack(side=tk.LEFT, expand=True)
+        
+        refresh_btn = tk.Button(nav_frame, text="Refresh", command=self.update_file_list)
+        refresh_btn.pack(side=tk.LEFT, expand=True)
+        
+        ops_frame = tk.LabelFrame(left_frame, text="File Operations", padx=5, pady=5)
+        ops_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Button(ops_frame, text="New File", command=self.create_file_dialog).pack(side=tk.LEFT, expand=True)
+        tk.Button(ops_frame, text="New Folder", command=self.create_folder_dialog).pack(side=tk.LEFT, expand=True)
+        tk.Button(ops_frame, text="Delete", command=self.delete_item).pack(side=tk.LEFT, expand=True)
+        tk.Button(ops_frame, text="Soft Delete", command=self.soft_delete_item).pack(side=tk.LEFT, expand=True)
+        
+        self.update_path_display()
+        self.build_directory_tree()
+    
+    def create_right_panel(self):
+        right_frame = tk.Frame(self.root, bd=2, relief=tk.SUNKEN)
+        right_frame.pack(side=tk.RIGHT, expand=True, fill=tk.BOTH, padx=5, pady=5)
+        
+        info_frame = tk.LabelFrame(right_frame, text="File Information", padx=5, pady=5)
+        info_frame.pack(fill=tk.X, pady=5)
+        
+        self.file_info_text = tk.Text(info_frame, height=10, wrap=tk.WORD)
+        self.file_info_text.pack(fill=tk.BOTH, expand=True)
+        
+        disk_frame = tk.LabelFrame(right_frame, text="Disk Block Visualization", padx=5, pady=5)
+        disk_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        self.canvas = tk.Canvas(disk_frame, bg='white')
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        
+        stats_frame = tk.Frame(right_frame)
+        stats_frame.pack(fill=tk.X, pady=5)
+        
+        self.disk_stats_var = tk.StringVar()
+        stats_label = tk.Label(stats_frame, textvariable=self.disk_stats_var)
+        stats_label.pack(anchor=tk.W)
+        
+        self.update_disk_visualization()
+    
+    def update_status(self, message):
+        self.status_var.set(message)
+        self.root.update_idletasks()
+    
+    def update_path_display(self):
+        self.path_var.set(self.fs.current_path)
+    
+    def build_directory_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        
+        def build_tree(parent, node, path):
+            for name, item in node['contents'].items():
+                full_path = os.path.join(path, name)
+                if item['type'] == 'dir':
+                    node_id = self.tree.insert(parent, 'end', text=name, values=['dir', full_path])
+                    build_tree(node_id, item, full_path)
+                else:
+                    self.tree.insert(parent, 'end', text=name, values=['file', full_path, f"{item['size']} bytes"])
+        
+        root_node = self.tree.insert('', 'end', text="/", values=['dir', '/'])
+        build_tree(root_node, self.fs.root['/'], '/')
+    
+    def update_file_list(self):
+        self.update_path_display()
+        self.build_directory_tree()
+        self.update_disk_visualization()
+    
+    def on_tree_select(self, event):
+        selected = self.tree.selection()
+        if not selected:
+            return
+            
+        item = self.tree.item(selected[0])
+        values = item['values']
+        
+        if values and values[0] == 'file':
+            self.display_file_info(item['text'])
+        else:
+            self.file_info_text.delete(1.0, tk.END)
+            self.file_info_text.insert(tk.END, "Directory: " + item['text'])
+    
+    def display_file_info(self, filename):
+        try:
+            metadata = self.fs.read_file(filename)
+            self.file_info_text.delete(1.0, tk.END)
+            
+            info = f"Name: {filename}\n"
+            info += f"Type: File\n"
+            info += f"Size: {metadata['size']} bytes\n"
+            if metadata['blocks']:
+                if isinstance(metadata['blocks'][0], list):
+                    info += f"Blocks: {len(metadata['blocks'][0])} scattered blocks\n"
+                else:
+                    info += f"Blocks: {metadata['blocks'][0]}-{metadata['blocks'][0] + metadata['blocks'][1] - 1}\n"
+            else:
+                info += "Blocks: None\n"
+            info += f"Created: {metadata['created']}\n"
+            info += f"Modified: {metadata['modified']}\n"
+            info += f"Last Accessed: {metadata['accessed']}\n"
+            
+            self.file_info_text.insert(tk.END, info)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+    
+    def navigate_up(self):
+        try:
+            self.fs.cd("..")
+            self.update_file_list()
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+    
+    def navigate_home(self):
+        try:
+            self.fs.cd("/")
+            self.update_file_list()
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+    
+    def create_file_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Create New File")
+        
+        tk.Label(dialog, text="File Name:").grid(row=0, column=0, padx=5, pady=5)
+        name_entry = tk.Entry(dialog)
+        name_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        tk.Label(dialog, text="Size (bytes):").grid(row=1, column=0, padx=5, pady=5)
+        size_entry = tk.Entry(dialog)
+        size_entry.grid(row=1, column=1, padx=5, pady=5)
+        size_entry.insert(0, "0")
+        
+        def create_file():
+            try:
+                name = name_entry.get()
+                size = int(size_entry.get())
+                self.fs.create_file(name, size)
+                self.update_file_list()
+                dialog.destroy()
+                self.update_status(f"File '{name}' created successfully")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+        
+        tk.Button(dialog, text="Create", command=create_file).grid(row=2, column=1, sticky=tk.E, padx=5, pady=5)
+    
+    def create_folder_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Create New Folder")
+        
+        tk.Label(dialog, text="Folder Name:").grid(row=0, column=0, padx=5, pady=5)
+        name_entry = tk.Entry(dialog)
+        name_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        def create_folder():
+            try:
+                name = name_entry.get()
+                self.fs.mkdir(name)
+                self.update_file_list()
+                dialog.destroy()
+                self.update_status(f"Folder '{name}' created successfully")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+        
+        tk.Button(dialog, text="Create", command=create_folder).grid(row=1, column=1, sticky=tk.E, padx=5, pady=5)
+    
+    def delete_item(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please select an item to delete")
+            return
+            
+        item = self.tree.item(selected[0])
+        name = item['text']
+        
+        if messagebox.askyesno("Confirm Delete", f"Are you sure you want to permanently delete '{name}'?"):
+            try:
+                if item['values'][0] == 'dir':
+                    path = item['values'][1]
+                    current_path = self.fs.current_path
+                    self.fs.cd(path)
+                    self.fs.delete_file(name)
+                    self.fs.cd(current_path)
+                else:
+                    self.fs.delete_file(name)
+                
+                self.update_file_list()
+                self.update_status(f"'{name}' permanently deleted")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+    
+    def soft_delete_item(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please select an item to delete")
+            return
+            
+        item = self.tree.item(selected[0])
+        name = item['text']
+        
+        if messagebox.askyesno("Confirm Soft Delete", f"Are you sure you want to soft-delete '{name}' (recoverable)?"):
+            try:
+                if item['values'][0] == 'dir':
+                    messagebox.showwarning("Warning", "Cannot soft-delete directories")
+                    return
+                
+                self.fs.soft_delete_file(name)
+                self.update_file_list()
+                self.update_status(f"'{name}' soft-deleted (can be recovered)")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+    
+    def show_recovery_dialog(self):
+        if not hasattr(self.fs, 'deleted_files') or not self.fs.deleted_files:
+            messagebox.showinfo("Info", "No deleted files available for recovery")
+            return
+            
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Recover Deleted Files")
+        dialog.geometry("400x300")
+        
+        tk.Label(dialog, text="Select file to recover:").pack(pady=10)
+        
+        listbox = tk.Listbox(dialog)
+        listbox.pack(expand=True, fill=tk.BOTH, padx=10, pady=5)
+        
+        for (path, name) in self.fs.deleted_files.keys():
+            listbox.insert(tk.END, f"{name} (from {path})")
+        
+        def recover_selected():
+            selection = listbox.curselection()
+            if not selection:
+                return
+                
+            selected_key = list(self.fs.deleted_files.keys())[selection[0]]
+            try:
+                self.fs.recover_file(selected_key[1])
+                dialog.destroy()
+                self.update_file_list()
+                self.update_status(f"Recovered file '{selected_key[1]}'")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+        
+        tk.Button(dialog, text="Recover", command=recover_selected).pack(side=tk.LEFT, padx=10, pady=5)
+        tk.Button(dialog, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT, padx=10, pady=5)
+    
+    def update_disk_visualization(self):
+        self.canvas.delete("all")
+        usage = self.fs.get_disk_usage()
+        self.disk_stats_var.set(f"Disk Usage: {usage['used_blocks']}/{usage['total_blocks']} blocks ({usage['usage_percent']:.1f}%)")
+        
+        block_size = 20
+        blocks_per_row = 40
+        rows = (self.fs.total_blocks + blocks_per_row - 1) // blocks_per_row
+        
+        canvas_width = blocks_per_row * block_size
+        canvas_height = rows * block_size
+        self.canvas.config(width=canvas_width, height=canvas_height)
+        
+        for i in range(self.fs.total_blocks):
+            row = i // blocks_per_row
+            col = i % blocks_per_row
+            x1 = col * block_size
+            y1 = row * block_size
+            x2 = x1 + block_size - 1
+            y2 = y1 + block_size - 1
+            
+            color = 'red' if not self.fs.free_blocks[i] else 'green'
+            self.canvas.create_rectangle(x1, y1, x2, y2, fill=color, outline='black')
+    
+    def new_filesystem(self):
+        if messagebox.askyesno("New Filesystem", "Create a new empty filesystem? Current data will be lost."):
+            self.fs = FileSystem()
+            self.update_file_list()
+            self.update_status("New empty filesystem created")
+    
+    def load_filesystem(self):
+        filename = filedialog.askopenfilename(title="Load Filesystem", filetypes=[("FS Files", "*.fs")])
+        if filename:
+            try:
+                self.fs.load_state(filename)
+                self.update_file_list()
+                self.update_status(f"Filesystem loaded from {filename}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load filesystem: {str(e)}")
+    
+    def save_filesystem(self):
+        filename = filedialog.asksaveasfilename(title="Save Filesystem", defaultextension=".fs", filetypes=[("FS Files", "*.fs")])
+        if filename:
+            try:
+                self.fs.save_state(filename)
+                self.update_status(f"Filesystem saved to {filename}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save filesystem: {str(e)}")
+    
+    def run_fsck(self):
+        result = self.fs.fsck()
+        if isinstance(result, str):
+            messagebox.showinfo("Filesystem Check", result)
+        else:
+            messagebox.showwarning("Filesystem Check", "Issues found:\n\n" + "\n".join(result))
+        self.update_status("Filesystem check completed")
+    
+    def defragment(self):
+        result = self.fs.defragment()
+        self.update_disk_visualization()
+        messagebox.showinfo("Defragmentation", result)
+        self.update_status("Defragmentation completed")
+
+if _name_ == "_main_":
+    root = tk.Tk()
+    app = FileSystemGUI(root)
+    root.mainloop()

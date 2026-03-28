@@ -1,0 +1,336 @@
+import os
+import pickle
+import math
+from datetime import datetime
+from collections import defaultdict
+
+class FileSystem:
+    def _init_(self, size=1024*1024):  # 1MB default filesystem
+        self.size = size
+        self.block_size = 4096  # 4KB blocks
+        self.total_blocks = math.ceil(size / self.block_size)
+        self.free_blocks = [True] * self.total_blocks
+        self.root = {'/': {'type': 'dir', 'contents': {}}}
+        self.current_dir = self.root['/']
+        self.current_path = '/'
+        self.file_table = {}
+        self.journal = []
+        self.last_checkpoint = None
+        self.deleted_files = {}  # Stores soft-deleted files
+
+    def allocate_blocks(self, num_blocks):
+        if num_blocks <= 0:
+            return -1
+            
+        consecutive = 0
+        start = -1
+        for i, free in enumerate(self.free_blocks):
+            if free:
+                if consecutive == 0:
+                    start = i
+                consecutive += 1
+                if consecutive == num_blocks:
+                    for j in range(start, start + num_blocks):
+                        self.free_blocks[j] = False
+                    return start
+            else:
+                consecutive = 0
+        raise Exception("Not enough free space")
+    
+    def free_blocks(self, start, num_blocks):
+        if start == -1 or num_blocks <= 0:
+            return
+            
+        for i in range(start, start + num_blocks):
+            if i < len(self.free_blocks):
+                self.free_blocks[i] = True
+
+    def create_file(self, name, size=0):
+        if name in self.current_dir['contents']:
+            raise Exception("File already exists")
+        
+        blocks_needed = math.ceil(size / self.block_size)
+        start_block = self.allocate_blocks(blocks_needed) if blocks_needed > 0 else -1
+            
+        inode = {
+            'type': 'file',
+            'size': size,
+            'blocks': (start_block, blocks_needed) if blocks_needed > 0 else None,
+            'created': datetime.now(),
+            'modified': datetime.now(),
+            'accessed': datetime.now()
+        }
+        
+        self.journal.append(('create', self.current_path, name, inode))
+        self.file_table[(self.current_path, name)] = inode
+        self.current_dir['contents'][name] = inode
+        self.last_checkpoint = datetime.now()
+        return inode
+
+    def delete_file(self, name):
+        if name not in self.current_dir['contents']:
+            raise Exception("File not found")
+            
+        inode = self.current_dir['contents'][name]
+        self.journal.append(('delete', self.current_path, name, inode))
+        
+        if inode['blocks']:
+            start, num = inode['blocks']
+            self.free_blocks(start, num)
+        
+        del self.file_table[(self.current_path, name)]
+        del self.current_dir['contents'][name]
+        self.last_checkpoint = datetime.now()
+
+    def soft_delete_file(self, name):
+        """New method for recoverable deletion"""
+        if name not in self.current_dir['contents']:
+            raise Exception("File not found")
+            
+        inode = self.current_dir['contents'][name].copy()
+        inode['deleted'] = True
+        inode['deletion_time'] = datetime.now()
+        
+        self.deleted_files[(self.current_path, name)] = {
+            'inode': inode,
+            'original_path': self.current_path,
+            'original_dir': self.current_dir
+        }
+        
+        # Perform actual deletion
+        self.delete_file(name)
+        return True
+
+    def recover_file(self, name):
+        """New method to recover soft-deleted files"""
+        if not self.deleted_files:
+            raise Exception("No deleted files available")
+            
+        # Find the file in deleted_files
+        file_key = None
+        for (path, fname), data in self.deleted_files.items():
+            if fname == name:
+                file_key = (path, fname)
+                break
+                
+        if not file_key:
+            raise Exception("File not found in recovery store")
+            
+        data = self.deleted_files[file_key]
+        inode = data['inode']
+        
+        # Restore to original location
+        original_dir = data['original_dir']
+        original_path = data['original_path']
+        
+        # Verify path still exists
+        if original_path != '/':
+            parts = original_path.split('/')[1:]
+            current = self.root['/']
+            for part in parts:
+                if part not in current['contents']:
+                    raise Exception("Original path no longer exists")
+                current = current['contents'][part]
+        
+        # Restore the file
+        del inode['deleted']
+        del inode['deletion_time']
+        original_dir['contents'][name] = inode
+        self.file_table[(original_path, name)] = inode
+        
+        # Remove from deleted files
+        del self.deleted_files[file_key]
+        self.journal.append(('recover', original_path, name, inode))
+        self.last_checkpoint = datetime.now()
+        return True
+
+    def read_file(self, name):
+        if name not in self.current_dir['contents']:
+            raise Exception("File not found")
+            
+        inode = self.current_dir['contents'][name]
+        inode['accessed'] = datetime.now()
+        return inode
+
+    def write_file(self, name, new_size):
+        if name not in self.current_dir['contents']:
+            raise Exception("File not found")
+            
+        old_inode = self.current_dir['contents'][name].copy()
+        self.journal.append(('write_before', self.current_path, name, old_inode))
+        
+        if old_inode['blocks']:
+            start, num = old_inode['blocks']
+            self.free_blocks(start, num)
+        
+        blocks_needed = math.ceil(new_size / self.block_size)
+        start_block = self.allocate_blocks(blocks_needed) if blocks_needed > 0 else -1
+            
+        self.current_dir['contents'][name]['size'] = new_size
+        self.current_dir['contents'][name]['blocks'] = (start_block, blocks_needed) if blocks_needed > 0 else None
+        self.current_dir['contents'][name]['modified'] = datetime.now()
+        
+        self.journal.append(('write_after', self.current_path, name, self.current_dir['contents'][name].copy()))
+        self.last_checkpoint = datetime.now()
+        return self.current_dir['contents'][name]
+
+    def mkdir(self, name):
+        if name in self.current_dir['contents']:
+            raise Exception("Directory already exists")
+            
+        new_dir = {
+            'type': 'dir',
+            'contents': {},
+            'created': datetime.now(),
+            'modified': datetime.now()
+        }
+        
+        self.journal.append(('mkdir', self.current_path, name, new_dir))
+        self.current_dir['contents'][name] = new_dir
+        self.last_checkpoint = datetime.now()
+        return new_dir
+
+    def cd(self, path):
+        if path == '/':
+            self.current_dir = self.root['/']
+            self.current_path = '/'
+            return
+            
+        if path.startswith('/'):
+            parts = [p for p in path.split('/') if p]
+            current = self.root['/']
+            current_path = '/'
+        else:
+            parts = [p for p in path.split('/') if p]
+            current = self.current_dir
+            current_path = self.current_path
+            
+        for part in parts:
+            if part == '..':
+                if current_path == '/':
+                    continue
+                current_path_parts = current_path.split('/')
+                current_path = '/'.join(current_path_parts[:-1]) or '/'
+                current = self.root['/']
+                if current_path != '/':
+                    for p in current_path.split('/')[1:]:
+                        current = current['contents'][p]
+            elif part in current['contents'] and current['contents'][part]['type'] == 'dir':
+                current = current['contents'][part]
+                current_path = os.path.join(current_path, part)
+            else:
+                raise Exception(f"Directory not found: {part}")
+                
+        self.current_dir = current
+        self.current_path = current_path
+
+    def ls(self):
+        return list(self.current_dir['contents'].keys())
+
+    def fsck(self):
+        errors = []
+        allocated_in_file_system = set()
+        for inode in self.file_table.values():
+            if inode['blocks']:
+                start, num = inode['blocks']
+                for i in range(start, start + num):
+                    allocated_in_file_system.add(i)
+        
+        for i, free in enumerate(self.free_blocks):
+            if free and i in allocated_in_file_system:
+                errors.append(f"Block {i} marked free but is allocated")
+            if not free and i not in allocated_in_file_system:
+                errors.append(f"Block {i} marked allocated but is free")
+        
+        def check_dir(dir_node, path):
+            for name, item in dir_node['contents'].items():
+                if item['type'] == 'dir':
+                    check_dir(item, os.path.join(path, name))
+                else:
+                    if (path, name) not in self.file_table:
+                        errors.append(f"File {os.path.join(path, name)} missing in file table")
+        
+        check_dir(self.root['/'], '/')
+        return errors if errors else "No errors found"
+
+    def defragment(self):
+        files_with_blocks = [
+            (path, name, inode) 
+            for (path, name), inode in self.file_table.items() 
+            if inode['blocks'] and not isinstance(inode['blocks'][0], list)
+        ]
+        
+        files_with_blocks.sort(key=lambda x: x[2]['blocks'][0])
+        
+        current_block = 0
+        moved_files = 0
+        
+        for path, name, inode in files_with_blocks:
+            old_start, num_blocks = inode['blocks']
+            
+            if old_start != current_block:
+                try:
+                    # Free old blocks
+                    self.free_blocks(old_start, num_blocks)
+                    
+                    # Allocate new blocks
+                    new_start = self.allocate_blocks(num_blocks)
+                    if new_start != current_block:
+                        raise Exception("Couldn't allocate contiguous blocks")
+                    
+                    # Update inode
+                    inode['blocks'] = (new_start, num_blocks)
+                    
+                    # Update directory entry
+                    parts = path.split('/')[1:]
+                    current_dir = self.root['/']
+                    for part in parts:
+                        current_dir = current_dir['contents'][part]
+                    current_dir['contents'][name]['blocks'] = (new_start, num_blocks)
+                    
+                    moved_files += 1
+                except Exception:
+                    # If allocation fails, restore old blocks
+                    for i in range(old_start, old_start + num_blocks):
+                        if i < len(self.free_blocks):
+                            self.free_blocks[i] = False
+                    continue
+            
+            current_block += num_blocks
+        
+        return f"Defragmentation complete. Moved {moved_files} files."
+
+    def save_state(self, filename):
+        with open(filename, 'wb') as f:
+            pickle.dump({
+                'size': self.size,
+                'block_size': self.block_size,
+                'free_blocks': self.free_blocks,
+                'root': self.root,
+                'file_table': self.file_table,
+                'journal': self.journal,
+                'deleted_files': self.deleted_files
+            }, f)
+
+    def load_state(self, filename):
+        with open(filename, 'rb') as f:
+            state = pickle.load(f)
+            self.size = state['size']
+            self.block_size = state['block_size']
+            self.free_blocks = state['free_blocks']
+            self.root = state['root']
+            self.file_table = state['file_table']
+            self.journal = state['journal']
+            self.deleted_files = state.get('deleted_files', {})
+            self.current_dir = self.root['/']
+            self.current_path = '/'
+
+    def get_disk_usage(self):
+        total_used = sum(1 for block in self.free_blocks if not block)
+        total_free = sum(1 for block in self.free_blocks if block)
+        return {
+            'total_blocks': self.total_blocks,
+            'used_blocks': total_used,
+            'free_blocks': total_free,
+            'usage_percent': (total_used / self.total_blocks) * 100
+        }
